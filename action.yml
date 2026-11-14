@@ -33,18 +33,124 @@ inputs:
   repository-path:
     description: Checkout to publish; check it out with fetch-depth 0.
     default: "."
+  deploy:
+    description: >-
+      Where the Wiki goes. pages deploys it as the whole Pages site; branch
+      writes it into a folder of a branch that Pages serves, such as gh-pages,
+      and leaves the rest of that branch alone; none only builds it and
+      returns its folder as site-path.
+    default: pages
+  path:
+    description: >-
+      Folder of the site the Wiki is published under, for branch and none,
+      such as wiki or docs/code. Defaults to wiki.
+    default: ""
+  base-path:
+    description: >-
+      Full URL path the Wiki is served from, such as /my-repo/wiki. Overrides
+      the path read from the Pages settings plus path; use it for a custom
+      domain or a host other than Pages.
+    default: ""
+  branch:
+    description: Branch that branch writes to.
+    default: gh-pages
 
 outputs:
   page-url:
     description: Address of the published Wiki.
-    value: ${{ steps.deploy.outputs.page_url }}
+    value: ${{ steps.deploy.outputs.page_url || steps.target.outputs.page_url }}
+  site-path:
+    description: Folder that holds the built Wiki on the runner.
+    value: ${{ steps.publish.outputs.site-path }}
 
 runs:
   using: composite
   steps:
+    - name: Check the deploy inputs
+      id: mode
+      shell: bash
+      env:
+        INPUT_DEPLOY: ${{ inputs.deploy }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_BASE_PATH: ${{ inputs.base-path }}
+        INPUT_BRANCH: ${{ inputs.branch }}
+      run: |
+        set -euo pipefail
+        case "$INPUT_DEPLOY" in
+          pages|branch|none) ;;
+          *)
+            echo "::error title=CodeNib Wiki::deploy must be pages, branch or none, not '$INPUT_DEPLOY'."
+            exit 2
+            ;;
+        esac
+        wiki_path="${INPUT_PATH#/}"
+        wiki_path="${wiki_path%/}"
+        if [[ "$INPUT_DEPLOY" == pages ]]; then
+          if [[ -n "$wiki_path" || -n "$INPUT_BASE_PATH" ]]; then
+            echo "::error title=CodeNib Wiki::path and base-path apply to deploy: branch or none. deploy: pages publishes the Wiki as the whole site."
+            exit 2
+          fi
+        else
+          wiki_path="${wiki_path:-wiki}"
+          if [[ ! "$wiki_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ ]] \
+            || [[ "/$wiki_path/" == */./* || "/$wiki_path/" == */../* || "/$wiki_path/" == */.git/* ]]; then
+            echo "::error title=CodeNib Wiki::path must be a relative folder such as wiki or docs/code, not '$INPUT_PATH'."
+            exit 2
+          fi
+        fi
+        if [[ -n "$INPUT_BASE_PATH" && "$INPUT_BASE_PATH" != /* ]]; then
+          echo "::error title=CodeNib Wiki::base-path must start with /, such as /my-repo/wiki."
+          exit 2
+        fi
+        if [[ "$INPUT_DEPLOY" == branch ]] \
+          && ! git check-ref-format --branch "$INPUT_BRANCH" >/dev/null 2>&1; then
+          echo "::error title=CodeNib Wiki::branch '$INPUT_BRANCH' is not a valid branch name."
+          exit 2
+        fi
+        echo "wiki_path=$wiki_path" >> "$GITHUB_OUTPUT"
+
+    # With enablement off this only reads the Pages settings, so it never
+    # switches a branch-served site to GitHub Actions.
     - name: Configure GitHub Pages
       id: pages
+      if: ${{ inputs.base-path == '' }}
+      continue-on-error: ${{ inputs.deploy == 'none' }}
       uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+
+    - name: Resolve the Wiki address
+      id: target
+      shell: bash
+      env:
+        INPUT_DEPLOY: ${{ inputs.deploy }}
+        INPUT_BASE_PATH: ${{ inputs.base-path }}
+        WIKI_PATH: ${{ steps.mode.outputs.wiki_path }}
+        PAGES_OUTCOME: ${{ steps.pages.outcome }}
+        PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+      run: |
+        set -euo pipefail
+        if [[ "$INPUT_DEPLOY" == pages ]]; then
+          base_path="$PAGES_BASE_PATH"
+          site_url="$PAGES_BASE_URL"
+        elif [[ -n "$INPUT_BASE_PATH" ]]; then
+          base_path="${INPUT_BASE_PATH%/}"
+          site_url=""
+        elif [[ "$PAGES_OUTCOME" == success ]]; then
+          base_path="${PAGES_BASE_PATH%/}/$WIKI_PATH"
+          site_url="${PAGES_BASE_URL%/}/$WIKI_PATH"
+        else
+          echo "::error title=CodeNib Wiki::This repository has no Pages site to read the Wiki's address from. Set base-path to the URL path the Wiki will be served from."
+          exit 2
+        fi
+        page_url=""
+        if [[ "$INPUT_DEPLOY" != pages && -n "$site_url" ]]; then
+          page_url="$site_url/"
+        fi
+        {
+          echo "base_path=$base_path"
+          echo "site_url=$site_url"
+          echo "page_url=$page_url"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Build the Wiki
       id: publish
@@ -53,8 +159,8 @@ runs:
         CODENIB_ACTION_WIKI_KEY: ${{ inputs.api-key }}
       with:
         repository-path: ${{ inputs.repository-path }}
-        base-path: ${{ steps.pages.outputs.base_path }}
-        site-url: ${{ steps.pages.outputs.base_url }}
+        base-path: ${{ steps.target.outputs.base_path }}
+        site-url: ${{ steps.target.outputs.site_url }}
         wiki: ${{ inputs.wiki }}
         wiki-model: ${{ inputs.model }}
         wiki-api-key-env: ${{ inputs.api-key != '' && 'CODENIB_ACTION_WIKI_KEY' || '' }}
@@ -63,10 +169,22 @@ runs:
         upload-context: "false"
 
     - name: Upload the site
+      if: ${{ inputs.deploy == 'pages' }}
       uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
       with:
         path: ${{ steps.publish.outputs.site-path }}
 
     - name: Deploy to GitHub Pages
       id: deploy
+      if: ${{ inputs.deploy == 'pages' }}
       uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
+
+    - name: Write the Wiki into the Pages branch
+      if: ${{ inputs.deploy == 'branch' }}
+      shell: bash
+      env:
+        INPUT_REPOSITORY_PATH: ${{ inputs.repository-path }}
+        BRANCH: ${{ inputs.branch }}
+        WIKI_PATH: ${{ steps.mode.outputs.wiki_path }}
+        SITE_PATH: ${{ steps.publish.outputs.site-path }}
+      run: bash "$GITHUB_ACTION_PATH/publish-to-branch.sh"
