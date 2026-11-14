@@ -39,7 +39,12 @@ jobs:
           api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-1. In **Settings > Pages**, choose **GitHub Actions** as the source.
+1. In **Settings > Pages**, choose **GitHub Actions** as the source. The Wiki
+   then becomes the repository's whole Pages site: it replaces a site already
+   deployed there, and a site served from a branch such as `gh-pages` stops
+   being served. To keep an existing site, use a repository without one, or
+   [build the Wiki without deploying it](https://docs.codenib.ai/github_pages/#build-without-deployment)
+   and host the output elsewhere.
 2. Add an [OpenRouter](https://openrouter.ai/) key as the Actions secret
    `OPENROUTER_API_KEY`, with a spending limit on the key.
 3. Push. The first run writes every page; later pushes rewrite only the pages
